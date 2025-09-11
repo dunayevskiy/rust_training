@@ -118,7 +118,7 @@ jobs:
     - name: Pull from GitHub and Push to ECR
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: ${{ ECR_REPOSITORY }}
+        ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
         GITHUB_IMAGE: ghcr.io/${{ github.repository }}:latest
         IMAGE_TAG: ${{ github.sha }}
       run: |
