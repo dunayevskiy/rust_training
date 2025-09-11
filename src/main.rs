@@ -23,12 +23,12 @@ fn main() {
     println!("Add: 10 + 5 = {}", add(10, 5));
     println!("Subtract: 10 - 3 = {}", subtract(10, 3));
     println!("Multiply: 4 * 7 = {}", multiply(4, 7));
-    
+
     match divide(20, 4) {
         Ok(result) => println!("Divide: 20 / 4 = {}", result),
         Err(e) => println!("Error: {}", e),
     }
-    
+
     println!("Calculator finished!");
 }
 
