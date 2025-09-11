@@ -12,6 +12,8 @@ env:
   IMAGE_NAME: ${{ github.repository }}
   AWS_REGION: eu-west-2
   ECR_REPOSITORY: cicd_training
+  ECS_CLUSTER: exciting-hiphop-party
+  ECS_TASK_DEFINITION: rust-calculator
 
 jobs:
   test:
@@ -146,3 +148,195 @@ jobs:
         echo "🎉 Image now available in AWS ECR!"
         echo "Use this URI in AWS services:"
         echo "${{ steps.login-ecr.outputs.registry }}/rust-training:latest"
+
+  deploy-to-fargate:
+      needs: push-to-ecr
+      runs-on: ubuntu-latest
+      
+      steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check if ECS cluster exists
+        id: check-cluster
+        run: |
+          if aws ecs describe-clusters --clusters ${{ env.ECS_CLUSTER }} --query 'clusters[0].clusterName' --output text 2>/dev/null; then
+            echo "cluster-exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "cluster-exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create ECS cluster if it doesn't exist
+        if: steps.check-cluster.outputs.cluster-exists == 'false'
+        run: |
+          echo "Creating ECS cluster: ${{ env.ECS_CLUSTER }}"
+          aws ecs create-cluster --cluster-name ${{ env.ECS_CLUSTER }}
+
+      - name: Create CloudWatch log group
+        run: |
+          aws logs create-log-group \
+            --log-group-name /ecs/${{ env.ECS_TASK_DEFINITION }} \
+            --region ${{ env.AWS_REGION }} || true
+
+      - name: Get ECR image URI
+        id: get-image
+        run: |
+          IMAGE_URI="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Using image: $IMAGE_URI"
+
+      - name: Create task definition
+        id: create-task-def
+        run: |
+          cat > task-definition.json << EOF
+          {
+            "family": "${{ env.ECS_TASK_DEFINITION }}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "1024",
+            "memory": "2048",
+            "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [
+              {
+                "name": "rust-app",
+                "image": "${{ steps.get-image.outputs.image-uri }}",
+                "essential": true,
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/${{ env.ECS_TASK_DEFINITION }}",
+                    "awslogs-region": "${{ env.AWS_REGION }}",
+                    "awslogs-stream-prefix": "fargate",
+                    "awslogs-create-group": "true"
+                  }
+                },
+                "environment": [
+                  {
+                    "name": "GITHUB_RUN_ID",
+                    "value": "${{ github.run_id }}"
+                  },
+                  {
+                    "name": "COMMIT_SHA", 
+                    "value": "${{ github.sha }}"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          
+          echo "Task definition created:"
+          cat task-definition.json
+
+      - name: Register task definition
+        id: register-task
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+          echo "Registered task definition: $TASK_DEF_ARN"
+
+      - name: Run Fargate task (optional - for testing)
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+        id: run-task
+        run: |
+          # Get network configuration
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=is-default,Values=true" \
+            --query 'Vpcs[0].VpcId' \
+            --output text)
+          
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[0].SubnetId' \
+            --output text)
+          
+          echo "Using VPC: $VPC_ID, Subnet: $SUBNET_ID"
+          
+          # Run the task
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --task-definition ${{ steps.register-task.outputs.task-def-arn }} \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],assignPublicIp=ENABLED}" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+          
+          echo "task-arn=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "Started Fargate task: $TASK_ARN"
+
+      - name: Wait for task completion (optional)
+        if: steps.run-task.outputs.task-arn
+        run: |
+          TASK_ARN="${{ steps.run-task.outputs.task-arn }}"
+          echo "Waiting for task to complete: $TASK_ARN"
+          
+          # Wait up to 5 minutes
+          for i in {1..10}; do
+            STATUS=$(aws ecs describe-tasks \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' \
+              --output text)
+            
+            echo "Task status: $STATUS (attempt $i/10)"
+            
+            if [[ "$STATUS" == "STOPPED" ]]; then
+              EXIT_CODE=$(aws ecs describe-tasks \
+                --cluster ${{ env.ECS_CLUSTER }} \
+                --tasks "$TASK_ARN" \
+                --query 'tasks[0].containers[0].exitCode' \
+                --output text)
+              
+              echo "Task completed with exit code: $EXIT_CODE"
+              
+              if [[ "$EXIT_CODE" == "0" ]]; then
+                echo "✅ Task succeeded!"
+              else
+                echo "❌ Task failed!"
+                exit 1
+              fi
+              break
+            fi
+            
+            sleep 30
+          done
+
+      - name: Get task logs
+        if: always() && steps.run-task.outputs.task-arn
+        run: |
+          # Extract task ID from ARN  
+          TASK_ARN="${{ steps.run-task.outputs.task-arn }}"
+          TASK_ID=$(echo "$TASK_ARN" | rev | cut -d'/' -f1 | rev)
+          
+          echo "Getting logs for task: $TASK_ID"
+          
+          # Get logs (may take a moment to appear)
+          sleep 10
+          aws logs get-log-events \
+            --log-group-name "/ecs/${{ env.ECS_TASK_DEFINITION }}" \
+            --log-stream-name "fargate/rust-app/$TASK_ID" \
+            --query 'events[*].message' \
+            --output text || echo "Logs not available yet"
+
+      - name: Deployment summary
+        run: |
+          echo "## Fargate Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster**: ${{ env.ECS_CLUSTER }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Task Definition**: ${{ steps.register-task.outputs.task-def-arn }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ steps.get-image.outputs.image-uri }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ -n "${{ steps.run-task.outputs.task-arn }}" ]]; then
+            echo "- **Task ARN**: ${{ steps.run-task.outputs.task-arn }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status**: Task executed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: Task definition registered (not executed)" >> $GITHUB_STEP_SUMMARY
+          fi
