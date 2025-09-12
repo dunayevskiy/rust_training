@@ -10,6 +10,10 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: cicd_training
+  ECS_CLUSTER: exciting-hiphop-party
+  ECS_TASK_DEFINITION: rust-calculator
 
 jobs:
   test:
@@ -89,3 +93,58 @@ jobs:
         # Optimize for minimal size
         provenance: false
         sbom: false
+
+  push-to-ecr:
+    needs: docker
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Pull from GitHub and Push to ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        GITHUB_IMAGE: ghcr.io/${{ github.repository }}:latest
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        echo "📦 Pulling image from GitHub Container Registry..."
+        docker pull $GITHUB_IMAGE
+        
+        echo "🏷️ Tagging image for ECR..."
+        # Tag with commit SHA
+        docker tag $GITHUB_IMAGE $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        # Tag with 'latest'
+        docker tag $GITHUB_IMAGE $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        
+        echo "🚀 Pushing to Amazon ECR..."
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        
+        echo "✅ Successfully pushed to ECR!"
+        echo "📍 ECR URI: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+        
+        # Save ECR URI for potential use in other jobs
+        echo "ecr-uri=$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> $GITHUB_OUTPUT
+
+    - name: Display ECR Information
+      run: |
+        echo "🎉 Image now available in AWS ECR!"
+        echo "Use this URI in AWS services:"
+        echo "${{ steps.login-ecr.outputs.registry }}/rust-training:latest"
